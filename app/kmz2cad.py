@@ -21,6 +21,7 @@ DXF_OUT  = "exportado_wgs84.dxf"
 DWG_OUT  = "exportado_wgs84.dwg"       # solo si ODA/Teigha está instalado
 PRJ_OUT  = "exportado_wgs84.prj"
 PDF_OUT  = "plano_wgs84.pdf"
+SATELLITE_BACKGROUND = False
 
 PNG_W84  = "satellite_wgs84.png"       # raster descargado (WGS84)
 PGW_W84  = "satellite_wgs84.pgw"       # worldfile en grados
@@ -276,13 +277,25 @@ def main():
     lats = [lat for g in (lines_ll + polys_ll) for lon,lat in g]
     bbox84 = bbox_wgs84(lons, lats, margin_ratio=0.02)
 
-    print("[INFO] Descargando imagen satelital (WGS84)…")
-    fetch_esri_world_imagery_png(bbox84, PNG_W84, size=2048)
-    print(f"[OK] Imagen: {PNG_W84}")
+    # Fondo satelital desactivado (o resiliente)
+    if SATELLITE_BACKGROUND:
+        have_raster = False
+        try:
+            print("[INFO] Descargando imagen satelital (WGS84)…")
+            fetch_esri_world_imagery_png(bbox84, PNG_W84, size=2048)
+            print(f"[OK] Imagen: {PNG_W84}")
+    
+            print("[INFO] Escribiendo worldfile (PGW, WGS84)…")
+            img_bbox_ll = write_pgw_wgs84(PNG_W84, bbox84, PGW_W84)
+            print(f"[OK] Worldfile: {PGW_W84}")
+            have_raster = True
+        except Exception as e:
+            print(f"[WARN] No se pudo obtener satélite. Continuando sin raster. Detalle: {e}")
+            img_bbox_ll = bbox84  # usamos el bbox vectorial
+    else:
+        # Modo sin satélite: simple, rápido y sin dependencias externas
+        img_bbox_ll = bbox84
 
-    print("[INFO] Escribiendo worldfile (PGW, WGS84)…")
-    img_bbox_ll = write_pgw_wgs84(PNG_W84, bbox84, PGW_W84)
-    print(f"[OK] Worldfile: {PGW_W84}")
 
     print("[INFO] Creando DXF (todo en WGS84)…")
     make_dxf_wgs84(lines_ll, polys_ll, DXF_OUT, PNG_W84, img_bbox_ll)
