@@ -36,14 +36,17 @@ def parse_coords(text):
     return out
 
 def read_kml_roots_from_kmz(kmz_path):
-    roots=[]
+    roots = []
     with zipfile.ZipFile(kmz_path, "r") as zf:
-        names=[n for n in zf.namelist() if n.lower().endswith(".kml")]
+        names = [n for n in zf.namelist() if n.lower().endswith(".kml")]
         if not names:
             raise FileNotFoundError("El KMZ no contiene ningún .kml interno")
         for n in names:
-            roots.append(ET.fromstring(zf.read(n)))
+            data = zf.read(n)
+            root = _parse_kml_with_fallback(data, name=n)
+            roots.append(root)
     return roots
+
 
 def read_geometries_wgs84(kmz_path):
     lines, polys = [], []
@@ -797,6 +800,136 @@ def upsert_utm_4lines(
 
 import re
 from ezdxf.math import Vec2, Vec3
+
+# --- PEGAR ARRIBA (junto a imports) ---
+import re
+
+def _ensure_ns_on_kml_root(xml_text: str, prefix: str, uri: str) -> str:
+    """
+    Si en el texto aparece 'prefix:' pero no existe xmlns:prefix en <kml ...>,
+    inyecta xmlns:prefix="uri" en la etiqueta de apertura de <kml>.
+    """
+    if f"{prefix}:" in xml_text and f"xmlns:{prefix}=" not in xml_text:
+        # Inserta antes del '>' del primer <kml ...>
+        xml_text = re.sub(
+            r'(<\s*kml\b[^>]*)(>)',
+            rf'\1 xmlns:{prefix}="{uri}"\2',
+            xml_text,
+            count=1,
+            flags=re.IGNORECASE
+        )
+    return xml_text
+
+import re
+import xml.etree.ElementTree as ET
+
+_COMMON_NS = {
+    "kml":  "http://www.opengis.net/kml/2.2",
+    "gx":   "http://www.google.com/kml/ext/2.2",
+    "atom": "http://www.w3.org/2005/Atom",
+    "xsi":  "http://www.w3.org/2001/XMLSchema-instance",
+    "xlink":"http://www.w3.org/1999/xlink",
+    "gml":  "http://www.opengis.net/gml",
+    "ogr":  "http://ogr.maptools.org/",
+    "esri": "http://www.esri.com/",
+}
+
+def _inject_xmlns_in_root(xml_text: str, pfx: str, uri: str) -> str:
+    # inserta xmlns:pfx="uri" en la etiqueta de apertura de <...> raíz
+    # (respetando mayúsculas/minúsculas y posibles prefijos en el nombre)
+    return re.sub(
+        r'(<\s*[^?!][^>\s]*\b[^>]*)(>)',
+        rf'\1 xmlns:{pfx}="{uri}"\2',
+        xml_text,
+        count=1
+    )
+
+def _declared_prefixes(xml_text: str) -> set[str]:
+    return set(re.findall(r'xmlns:([A-Za-z_][\w\-\.]*)\s*=', xml_text))
+
+def _used_tag_prefixes(xml_text: str) -> set[str]:
+    return set(re.findall(r'</?\s*([A-Za-z_][\w\-\.]*):[A-Za-z_][\w\-\.]*', xml_text))
+
+def _used_attr_prefixes(xml_text: str) -> set[str]:
+    return set(re.findall(r'\s([A-Za-z_][\w\-\.]*):[A-Za-z_][\w\-\.]*\s*=', xml_text))
+
+def _strip_prefix_from_tags(xml_text: str, prefixes: set[str]) -> str:
+    # <pfx:Name ...> → <Name ...> y </pfx:Name> → </Name>
+    for p in prefixes:
+        xml_text = re.sub(rf'(<\/?)\s*{re.escape(p)}:', r'\1', xml_text)
+    return xml_text
+
+def _remove_prefixed_attributes(xml_text: str, prefixes: set[str]) -> str:
+    # Quita atributos con prefijo no declarado:  pfx:attr="..."  o  pfx:attr='...'
+    for p in prefixes:
+        xml_text = re.sub(rf'\s{re.escape(p)}:[A-Za-z_][\w\-\.]*\s*=\s*"[^"]*"', '', xml_text)
+        xml_text = re.sub(rf"\s{re.escape(p)}:[A-Za-z_][\w\-\.]*\s*=\s*'[^']*'", '', xml_text)
+    return xml_text
+
+def _normalize_root_prefix(xml_text: str) -> str:
+    # Si la raíz es <kml:kml ...> o similar y NO está declarado xmlns:kml, lo inyecta.
+    m = re.search(r'<\s*([A-Za-z_][\w\-\.]*):([A-Za-z_][\w\-\.]*)\b', xml_text)  # etiqueta de apertura con prefijo
+    if m:
+        pfx = m.group(1)
+        decl = _declared_prefixes(xml_text)
+        if pfx not in decl:
+            uri = _COMMON_NS.get(pfx)
+            if uri:
+                xml_text = _inject_xmlns_in_root(xml_text, pfx, uri)
+    return xml_text
+
+def _parse_kml_with_fallback(raw_bytes: bytes, name: str = "?"):
+    """
+    Parse robusto para KML "sucios" con prefijos sin declarar:
+    1) Intenta parseo directo.
+    2) Si falla, normaliza raíz con prefijo (inyecta xmlns si es conocido).
+    3) Inyecta xmlns para prefijos conocidos encontrados (kml, gx, atom, ...).
+    4) Elimina prefijos NO declarados de etiquetas y elimina atributos con esos prefijos.
+    """
+    s = raw_bytes.decode("utf-8", errors="ignore")
+
+    # 1) Intento directo
+    try:
+        return ET.fromstring(s)
+    except ET.ParseError:
+        pass
+
+    # 2) Normaliza raíz con prefijo (ej. <kml:kml>)
+    s = _normalize_root_prefix(s)
+    try:
+        return ET.fromstring(s)
+    except ET.ParseError:
+        pass
+
+    # 3) Inyecta xmlns para prefijos comunes que se usen pero no estén declarados
+    used = _used_tag_prefixes(s) | _used_attr_prefixes(s)
+    decl = _declared_prefixes(s)
+    missing_known = [p for p in used if p in _COMMON_NS and p not in decl]
+    for p in missing_known:
+        s = _inject_xmlns_in_root(s, p, _COMMON_NS[p])
+    try:
+        return ET.fromstring(s)
+    except ET.ParseError:
+        pass
+
+    # 4) Quitar prefijos NO declarados de etiquetas y eliminar atributos con esos prefijos
+    decl = _declared_prefixes(s)  # refresca
+    used = _used_tag_prefixes(s) | _used_attr_prefixes(s)
+    missing = {p for p in used if p not in decl}
+    if missing:
+        s = _strip_prefix_from_tags(s, missing)
+        s = _remove_prefixed_attributes(s, missing)
+        # También quita xmlns de prefijos que quitamos, por si había basura
+        for p in missing:
+            s = re.sub(rf'\sxmlns:{re.escape(p)}="[^"]*"', '', s)
+        try:
+            return ET.fromstring(s)
+        except ET.ParseError as e:
+            raise ValueError(f"KML inválido ({name}): {e}")
+
+    # Si no había missing (raro), pero siguió fallando
+    raise ValueError(f"KML inválido ({name}): no se pudo normalizar namespaces")
+
 
 def _xy2(val):
     if val is None: return None
