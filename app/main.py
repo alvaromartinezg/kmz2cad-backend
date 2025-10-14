@@ -1,82 +1,50 @@
-# app/main.py
-import io, os, tempfile, shutil, zipfile, contextlib
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-from typing import List
+# app/main.py (o donde está tu endpoint de conversión)
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from pathlib import Path
+import os, shutil, sys, traceback
 
-os.environ.setdefault("MPLBACKEND", "Agg")
+from app.kmz2cad import main as kmz_main  # si tu main() está en app/kmz2cad.py
 
-app = FastAPI(title="KMZ→CAD Backend", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"]
-)
-
-@app.get("/")
-def root():
-    return {"ok": True, "msg": "KMZ→CAD up", "endpoints": ["/health","/process"]}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-def _collect_outputs(workdir: str) -> List[str]:
-    wanted = ["exportado_wgs84.dxf", "exportado_wgs84.prj",
-              "plano_wgs84.pdf", "exportado_wgs84.dwg"]
-    return [os.path.join(workdir, w) for w in wanted if os.path.exists(os.path.join(workdir, w))]
+app = FastAPI()
 
 @app.post("/process")
-def process_kmz(file: UploadFile = File(...)):
-    # ⬇️ Import aquí para no romper el arranque si falla una dependencia
+async def convert(file: UploadFile = File(...), output: str = Form("both")):
+    work = Path("/tmp/conv")
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    # 1) Guardar input en /tmp con el nombre que tu script espera
+    in_kmz = work / "Exportado.kmz"
+    with in_kmz.open("wb") as f:
+        f.write(await file.read())
+
+    # 2) Copiar la plantilla desde /app/app → /tmp
+    tpl_src = Path(__file__).with_name("PLANTILLA.dxf")       # /app/app/PLANTILLA.dxf
+    tpl_dst = work / "PLANTILLA.dxf"
+    if not tpl_src.exists():
+        raise HTTPException(500, f"No existe plantilla en {tpl_src}")
+    shutil.copy2(tpl_src, tpl_dst)
+
+    # 3) Ejecutar tu main() trabajando en /tmp
+    cwd = os.getcwd()
+    os.chdir(work)
     try:
-        import importlib
-        kmz2cad = importlib.import_module("app.kmz2cad")
-    except Exception as e:
-        # Devolvemos el error real para diagnosticar
-        raise HTTPException(status_code=500, detail=f"Import error: {e}")
+        kmz_main()   # tu main() usa nombres relativos, funcionará en /tmp
+    except Exception:
+        tb = traceback.format_exc()
+        os.chdir(cwd)
+        raise HTTPException(500, f"Fallo en main():\n{tb}")
+    os.chdir(cwd)
 
-    if not file.filename.lower().endswith(".kmz"):
-        raise HTTPException(status_code=400, detail="Sube un archivo .kmz")
+    # 4) Devolver salidas (al menos PDF o DXF)
+    pdf = work / "I-01.pdf"
+    dxf = work / "PLANTILLA_FINAL.dxf"
+    dwg = work / "exportado_wgs84.dwg"
 
-    content = file.file.read()
-    if len(content) == 0:
-        raise HTTPException(status_code=400, detail="KMZ vacío")
+    outs = [p for p in (pdf, dxf, dwg) if p.exists()]
+    if not outs:
+        raise HTTPException(500, "No se generaron salidas.")
 
-    tmpdir = tempfile.mkdtemp(prefix="kmz2cad_")
-    try:
-        kmz_path = os.path.join(tmpdir, "Exportado.kmz")
-        with open(kmz_path, "wb") as f:
-            f.write(content)
-
-        cwd = os.getcwd()
-        try:
-            os.chdir(tmpdir)
-            kmz2cad.main()
-        finally:
-            os.chdir(cwd)
-
-        outputs = _collect_outputs(tmpdir)
-        if not outputs:
-            raise HTTPException(status_code=500, detail="No se generaron salidas.")
-
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for abs_path in outputs:
-                zf.write(abs_path, arcname=os.path.basename(abs_path))
-        buf.seek(0)
-
-        return StreamingResponse(
-            buf,
-            media_type="application/zip",
-            headers={"Content-Disposition": 'attachment; filename="kmz2cad_outputs.zip"'}
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-    finally:
-        with contextlib.suppress(Exception):
-            shutil.rmtree(tmpdir)
+    # si piden ambos, arma ZIP; si no, devuelve lo que pidió
+    # (deja tu lógica actual aquí)
+    ...
