@@ -1,48 +1,30 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-KMZ → DXF (WGS84) → (opcional) DWG + PDF (UTM)
-- PDF en coordenadas UTM (zona detectada automáticamente).
-- DXF sigue en WGS84 (EPSG:4326) para calce en CAD.
-- Sin fondo satelital. Leyenda (pequeña) y Norte dentro del plano.
-- Márgenes internos del 10% alrededor del contenido.
-"""
-
 import os, zipfile, math, shutil, subprocess, xml.etree.ElementTree as ET
-from io import BytesIO
 
-# Backend sin GUI para matplotlib
+# backend sin GUI
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle, Circle
-from matplotlib.ticker import FormatStrFormatter
-
-from PIL import Image
 import ezdxf
+from ezdxf.addons.drawing import RenderContext, Frontend
+from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
 
-# ───────── Entradas / Salidas ─────────
-KMZ_NAME = "Exportado.kmz"
-
-DXF_OUT  = "exportado_wgs84.dxf"
-DWG_OUT  = "exportado_wgs84.dwg"
-PRJ_OUT  = "exportado_wgs84.prj"
-PDF_OUT  = "plano_wgs84.pdf"
-
-SATELLITE_BACKGROUND = False   # ← ignorado para PDF (no se dibuja)
-PNG_W84  = "satellite_wgs84.png"
-PGW_W84  = "satellite_wgs84.pgw"
-
-# Símbolo de norte (imagen exacta si existe)
-NORTH_PNG = "north_symbol.png"
+# ───────── CONFIG ─────────
+KMZ_NAME         = "Exportado.kmz"
+TEMPLATE_DXF_IN  = "PLANTILLA.dxf"        # tu plantilla (guardar como AutoCAD 2018 DXF)
+FINAL_DXF_OUT    = "PLANTILLA_FINAL.dxf"  # plantilla + nuevos datos en Model
+LAYOUT_NAME      = "I-01"                 # layout de salida
+PDF_OUT          = "I-01.pdf"             # PDF del layout
+CLEAN_DXF_OUT    = "exportado_wgs84.dxf"  # DXF limpio sin plantilla
+DWG_OUT          = "exportado_wgs84.dwg"  # intentará si ODA está instalado
+SHIFT_TO_LOCAL = True  # ← ponlo en True para mover el plano al origen (recomendado)
+PAPER_FRAME_RECT = (7.8839, 6.1980, 252.5161, 201.1238)
 
 # ───────── KML NS ─────────
 NS = {"kml":"http://www.opengis.net/kml/2.2"}
 for p,u in NS.items():
     ET.register_namespace("" if p=="kml" else p, u)
 
-# ==================== Utilidades KML ====================
+# ───────── Utilidades KML ─────────
 def parse_coords(text):
     out=[]
     if not text: return out
@@ -58,16 +40,14 @@ def read_kml_roots_from_kmz(kmz_path):
     with zipfile.ZipFile(kmz_path, "r") as zf:
         names=[n for n in zf.namelist() if n.lower().endswith(".kml")]
         if not names:
-            raise FileNotFoundError("El KMZ no contiene ningún .kml")
+            raise FileNotFoundError("El KMZ no contiene ningún .kml interno")
         for n in names:
-            data = zf.read(n)
-            roots.append(ET.fromstring(data))
+            roots.append(ET.fromstring(zf.read(n)))
     return roots
 
 def read_geometries_wgs84(kmz_path):
-    lines=[]; polys=[]
-    roots = read_kml_roots_from_kmz(kmz_path)
-    for root in roots:
+    lines, polys = [], []
+    for root in read_kml_roots_from_kmz(kmz_path):
         for ls in root.findall(".//kml:LineString", NS):
             ce = ls.find("kml:coordinates", NS)
             pts = parse_coords(ce.text if ce is not None else "")
@@ -76,11 +56,10 @@ def read_geometries_wgs84(kmz_path):
             ce = lr.find("kml:coordinates", NS)
             ring = parse_coords(ce.text if ce is not None else "")
             if len(ring)>=3:
-                if ring[0]!=ring[-1]: ring = ring + [ring[0]]
+                if ring[0]!=ring[-1]: ring.append(ring[0])
                 polys.append(ring)
     return lines, polys
 
-# ==================== BBoxes (WGS84) ====================
 def bbox_wgs84(lons, lats, margin_ratio=0.06):
     minlon, minlat = min(lons), min(lats)
     maxlon, maxlat = max(lons), max(lats)
@@ -88,107 +67,480 @@ def bbox_wgs84(lons, lats, margin_ratio=0.06):
     dy = (maxlat - minlat) * margin_ratio
     return (minlon - dx, minlat - dy, maxlon + dx, maxlat + dy)
 
-# ==================== Proyección UTM (para PDF) ====================
-def get_utm_zone_epsg(lon, lat):
-    """Devuelve (epsg, zona_str) para la lat/lon dada."""
-    zone = int(math.floor((lon + 180) / 6) + 1)
-    south = (lat < 0)
-    epsg = 32700 + zone if south else 32600 + zone
-    zone_str = f"{zone}{'S' if south else 'N'}"
-    return epsg, zone_str
-
-def project_to_utm(lines_ll, polys_ll, bbox_ll):
-    """Convierte listas de (lon,lat) a (E,N) en metros usando pyproj."""
+# KML usa ABGR (aabbggrr). Ignoramos la 'aa' y devolvemos (r,g,b)
+def kml_abgr_to_rgb(hexstr: str):
     try:
-        from pyproj import Transformer
-    except Exception as e:
-        raise RuntimeError("Se requiere pyproj para dibujar en UTM. Instala con: pip install pyproj") from e
-
-    minlon, minlat, maxlon, maxlat = bbox_ll
-    clon = (minlon + maxlon) / 2.0
-    clat = (minlat + maxlat) / 2.0
-    epsg, zone_str = get_utm_zone_epsg(clon, clat)
-
-    transformer = Transformer.from_crs(4326, epsg, always_xy=True)
-
-    def conv(seq):
-        return [transformer.transform(lon, lat) for lon, lat in seq]
-
-    lines_utm = [conv(pts) for pts in lines_ll]
-    polys_utm = [conv(ring) for ring in polys_ll]
-
-    # bbox UTM a partir de los datos proyectados
-    xs = [x for g in (lines_utm + polys_utm) for x,y in g]
-    ys = [y for g in (lines_utm + polys_utm) for x,y in g]
-    minx, miny, maxx, maxy = min(xs), min(ys), max(xs), max(ys)
-
-    # margen interno del 10 %
-    mx = 0.10 * (maxx - minx)
-    my = 0.10 * (maxy - miny)
-    bbox_utm = (minx - mx, miny - my, maxx + mx, maxy + my)
-
-    return lines_utm, polys_utm, bbox_utm, zone_str
-
-# ==================== DXF (WGS84) ====================
-def encode_dxf_transparency(alpha_0_255):
-    alpha = max(0, min(255, int(alpha_0_255)))
-    return (alpha << 24) | 0x02000000
-
-def apply_layer_transparency_if_supported(doc, layer_name, alpha_frac=0.5):
-    try:
-        layer = doc.layers.get(layer_name)
-        setattr(layer.dxf, "transparency", encode_dxf_transparency(int(255 * alpha_frac)))
+        s = hexstr.strip()
+        if s.startswith("#"): s = s[1:]
+        if len(s) != 8:  # debería ser aabbggrr
+            return (0, 0, 0)
+        aa = int(s[0:2], 16)  # alpha (no usado)
+        bb = int(s[2:4], 16)
+        gg = int(s[4:6], 16)
+        rr = int(s[6:8], 16)
+        return (rr, gg, bb)
     except Exception:
-        pass
+        return (0, 0, 0)
 
-def make_dxf_wgs84(lines_ll, polys_ll, dxf_path, png_path, bbox_wgs84):
-    doc = ezdxf.new("R2018")
+def build_kml_style_index(roots):
+    """Devuelve (style_line, stylemap) donde:
+       - style_line[id] = (r,g,b) de LineStyle/color
+       - stylemap[id]   = id de Style 'normal' (si hay StyleMap)
+    """
+    style_line = {}
+    stylemap = {}
+
+    for root in roots:
+        # <Style id="..."><LineStyle><color>aabbggrr</color>
+        for st in root.findall(".//kml:Style", NS):
+            sid = st.get("id")
+            if not sid: continue
+            ls = st.find("kml:LineStyle", NS)
+            if ls is not None:
+                ce = ls.find("kml:color", NS)
+                if ce is not None and ce.text:
+                    style_line[sid] = kml_abgr_to_rgb(ce.text)
+
+        # <StyleMap id="..."><Pair><key>normal</key><styleUrl>#something</styleUrl>
+        for sm in root.findall(".//kml:StyleMap", NS):
+            sid = sm.get("id")
+            if not sid: continue
+            pairs = sm.findall(".//kml:Pair", NS)
+            for pr in pairs:
+                key_el = pr.find("kml:key", NS)
+                url_el = pr.find("kml:styleUrl", NS)
+                if key_el is not None and url_el is not None and (key_el.text or "").strip().lower() == "normal":
+                    url = (url_el.text or "").strip()
+                    if url.startswith("#"): url = url[1:]
+                    stylemap[sid] = url
+    return style_line, stylemap
+
+def placemark_line_rgb(pm, style_line, stylemap):
+    """Color de línea para un Placemark (prefiere inline Style; si no, styleUrl)."""
+    # 1) Inline Style (si existe)
+    st = pm.find(".//kml:Style/kml:LineStyle/kml:color", NS)
+    if st is not None and st.text:
+        return kml_abgr_to_rgb(st.text)
+
+    # 2) styleUrl → id → StyleMap/Style
+    su = pm.find("kml:styleUrl", NS)
+    if su is not None and su.text:
+        url = su.text.strip()
+        if url.startswith("#"): url = url[1:]
+        # ¿es un StyleMap?
+        if url in stylemap:
+            url = stylemap[url]
+        # ¿hay Style con LineStyle?
+        if url in style_line:
+            return style_line[url]
+
+    # 3) Color por defecto si no hay nada en KML
+    return (0, 0, 0)
+
+def read_geometries_wgs84_colored(kmz_path):
+    """Retorna:
+       lines = [ ([(lon,lat),...], (r,g,b)), ... ]
+       polys = [ ([(lon,lat),...], (r,g,b)), ... ]  (color del contorno)
+    """
+    roots = read_kml_roots_from_kmz(kmz_path)
+    style_line, stylemap = build_kml_style_index(roots)
+
+    lines = []
+    polys = []
+
+    for root in roots:
+        for pm in root.findall(".//kml:Placemark", NS):
+            rgb = placemark_line_rgb(pm, style_line, stylemap)
+
+            # LineString
+            ls = pm.find(".//kml:LineString", NS)
+            if ls is not None:
+                ce = ls.find("kml:coordinates", NS)
+                pts = parse_coords(ce.text if ce is not None else "")
+                pts2 = [(lon, lat) for lon, lat in [(p[0], p[1]) for p in pts]]
+                if len(pts2) >= 2:
+                    lines.append((pts2, rgb))
+                continue
+
+            # Polygon (outerBoundary)
+            lr = pm.find(".//kml:Polygon/kml:outerBoundaryIs/kml:LinearRing", NS)
+            if lr is not None:
+                ce = lr.find("kml:coordinates", NS)
+                ring = parse_coords(ce.text if ce is not None else "")
+                ring2 = [(lon, lat) for lon, lat in [(p[0], p[1]) for p in ring]]
+                if len(ring2) >= 3:
+                    if ring2[0] != ring2[-1]:
+                        ring2.append(ring2[0])
+                    polys.append((ring2, rgb))
+
+    return lines, polys
+
+def shift_to_local_coords_colored(lines_col, polys_col):
+    # bbox original (en lon/lat)
+    lons = [x for (pts, _rgb) in (lines_col + polys_col) for x, y in pts]
+    lats = [y for (pts, _rgb) in (lines_col + polys_col) for x, y in pts]
+    minlon, minlat, maxlon, maxlat = min(lons), min(lats), max(lons), max(lats)
+    cx = (minlon + maxlon) / 2.0
+    cy = (minlat + maxlat) / 2.0
+
+    def sh(seq): return [(x - cx, y - cy) for x, y in seq]
+
+    lines_local = [(sh(pts), rgb) for (pts, rgb) in lines_col]
+    polys_local = [(sh(r),   rgb) for (r,   rgb) in polys_col]
+
+    w = (maxlon - minlon); h = (maxlat - minlat)
+    bbox_local = (-w/2, -h/2, w/2, h/2)
+    return lines_local, polys_local, bbox_local, (cx, cy)
+
+from ezdxf.colors import rgb2int
+
+def replace_model_content(doc, lines_col, polys_col, bbox84):
+    """Ahora espera:
+       lines_col = [ (pts, (r,g,b)), ... ]
+       polys_col = [ (ring, (r,g,b)), ... ]
+    """
     msp = doc.modelspace()
+    for e in list(msp):
+        try: e.destroy()
+        except Exception: pass
 
-    if "SATELLITE" not in doc.layers: doc.layers.add("SATELLITE")
-    if "LINES"     not in doc.layers: doc.layers.add("LINES", color=1)
-    if "POLYGONS"  not in doc.layers: doc.layers.add("POLYGONS", color=6)
-    if "ANNOTATIONS" not in doc.layers: doc.layers.add("ANNOTATIONS", color=7)
+    ensure_layers(doc)
 
-    apply_layer_transparency_if_supported(doc, "SATELLITE", 0.5)
+    # Líneas
+    for pts, rgb in lines_col:
+        if len(pts) == 2:
+            e = msp.add_line(pts[0], pts[1], dxfattribs={"layer":"LINES"})
+        else:
+            e = msp.add_lwpolyline(pts, dxfattribs={"layer":"LINES"})
+        try:
+            e.dxf.true_color = rgb2int(rgb)  # color real (RGB)
+            e.dxf.color = 256                # BYLAYER → ignorado si hay true_color
+        except Exception:
+            pass
 
-    # No insertar fondo porque SATELLITE_BACKGROUND=False
+    # Polígonos (contorno)
+    for ring, rgb in polys_col:
+        if len(ring) >= 3:
+            e = msp.add_lwpolyline(ring, dxfattribs={"layer":"POLYGONS", "closed": True})
+            try:
+                e.dxf.true_color = rgb2int(rgb)
+                e.dxf.color = 256
+            except Exception:
+                pass
 
+    # Extents / Unidades
+    minlon, minlat, maxlon, maxlat = bbox84
+    doc.header['$EXTMIN'] = (minlon, minlat, 0.0)
+    doc.header['$EXTMAX'] = (maxlon, maxlat, 0.0)
+    doc.header['$INSUNITS'] = 0
+
+# ───────── DXF helper ─────────
+def ensure_layers(doc):
+    layers = doc.layers
+    if "LINES" not in layers:     layers.add("LINES", color=1)      # rojo
+    if "POLYGONS" not in layers:  layers.add("POLYGONS", color=6)   # magenta
+    if "ANNOTATIONS" not in layers: layers.add("ANNOTATIONS", color=7)
+
+def shift_to_local_coords(lines_ll, polys_ll):
+    # centra el contenido en (0,0) restando el centroide del bbox
+    lons = [x for g in (lines_ll + polys_ll) for x, y in g]
+    lats = [y for g in (lines_ll + polys_ll) for x, y in g]
+    minlon, minlat, maxlon, maxlat = min(lons), min(lats), max(lons), max(lats)
+    cx = (minlon + maxlon) / 2.0
+    cy = (minlat + maxlat) / 2.0
+
+    def sh(seq): return [(x - cx, y - cy) for x, y in seq]
+
+    lines_local = [sh(pts) for pts in lines_ll]
+    polys_local = [sh(r) for r in polys_ll]
+    # bbox en coords locales
+    w = (maxlon - minlon)
+    h = (maxlat - minlat)
+    bbox_local = (-w/2, -h/2, w/2, h/2)
+    return lines_local, polys_local, bbox_local, (cx, cy)
+
+def _get_active_model_vport(doc):
+    """
+    Devuelve un VPORT '*ACTIVE' del Model. Si hay varios, toma el primero.
+    Si no existe, lo crea.
+    """
+    try:
+        vps = [v for v in doc.viewports if v.dxf.name.upper() == "*ACTIVE"]
+        if vps:
+            return vps[0]
+        return doc.viewports.new("*ACTIVE")
+    except Exception:
+        return doc.viewports.new("*ACTIVE")
+
+def center_model_view(doc, bbox84=None, pad=1.06):
+    """
+    Centra la vista de Model ajustando el VPORT '*ACTIVE' únicamente con
+    atributos soportados: center y height. Usa el bbox que ya calculaste.
+    """
+    if bbox84 is None:
+        return
+
+    # obtener/crear el VPORT *ACTIVE*
+    try:
+        vps = [v for v in doc.viewports if v.dxf.name.upper() == "*ACTIVE"]
+        vp = vps[0] if vps else doc.viewports.new("*ACTIVE")
+    except Exception:
+        vp = doc.viewports.new("*ACTIVE")
+
+    minx, miny, maxx, maxy = bbox84
+    cx = (minx + maxx) / 2.0
+    cy = (miny + maxy) / 2.0
+    extra_margin = 0.01 * max(maxx - minx, maxy - miny)  # ~1%
+    width  = (maxx - minx) + extra_margin
+    height = (maxy - miny) + extra_margin
+
+    # 'height' controla la altura visible en unidades de MODEL.
+    # usa el mayor de (ancho, alto) para asegurar que todo quepa
+    view_h = max(width, height, 1e-9)
+
+    # SOLO estos dos atributos son necesarios y portables en VPORT:
+    vp.dxf.center = (cx, cy)
+    vp.dxf.height = view_h
+
+def fit_layout_viewport(doc, layout_name, bbox, occupancy=0.58, safety=1.00,
+                        frame_rect=None):
+    if layout_name not in doc.layouts:
+        print(f"[WARN] No existe el layout '{layout_name}'.")
+        return
+    layout = doc.layouts.get(layout_name)
+
+    # 1) (opcional) recuadro del marco útil en PAPEL
+    #    Si se da, el viewport ocupará EXACTAMENTE ese rectángulo.
+    if frame_rect is not None:
+        x0, y0, x1, y1 = map(float, frame_rect)
+        paper_center = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        paper_size   = (x1 - x0, y1 - y0)
+        # borrar el viewport más grande si existe
+        for e in [e for e in layout if e.dxftype()=="VIEWPORT"]:
+            try: e.destroy()
+            except Exception: pass
+    else:
+        # fallback: heredar del viewport más grande
+        vps = [e for e in layout if e.dxftype()=="VIEWPORT"]
+        paper_center = (210.0, 148.5)
+        paper_size   = (200.0, 140.0)
+        if vps:
+            old = max(vps, key=lambda v: (v.dxf.width or 0)*(v.dxf.height or 0))
+            paper_center = (float(old.dxf.center[0]), float(old.dxf.center[1]))
+            paper_size   = (float(old.dxf.width or paper_size[0]),
+                            float(old.dxf.height or paper_size[1]))
+            try: old.destroy()
+            except Exception: pass
+
+    # 2) BBOX del MODEL → escala para que ocupe <= occupancy del viewport
+    minx, miny, maxx, maxy = bbox
+    cx = (minx + maxx) / 2.0
+    cy = (miny + maxy) / 2.0
+    w_model = max(maxx - minx, 1e-9)
+    h_model = max(maxy - miny, 1e-9)
+    vp_aspect = (paper_size[0] or 1.0) / (paper_size[1] or 1.0)
+    view_h = max(h_model/float(occupancy), w_model/(float(occupancy)*vp_aspect))
+    view_h *= float(safety)
+
+    # 3) Crear viewport centrado en el marco, tamaño = marco
+    vp = layout.add_viewport(
+        center=paper_center,
+        size=paper_size,
+        view_center_point=(cx, cy),
+        view_height=max(view_h, 1e-9),
+    )
+    try: vp.dxf.status = 1
+    except Exception: pass
+
+    # 4) Asegurar capas
+    for lname in ("LINES","POLYGONS"):
+        try:
+            L=doc.layers.get(lname); L.on(); L.thaw(); L.unlock()
+            if hasattr(vp,"is_layer_frozen") and vp.is_layer_frozen(lname):
+                vp.thaw_layer(lname)
+        except Exception:
+            pass
+
+def export_layout_pdf_viewport(doc, layout_name, pdf_path):
+
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    from ezdxf.math import Vec2, Vec3
+
+    def _xy(val):
+        if val is None:
+            return None
+        if isinstance(val, (Vec2, Vec3)):
+            return float(val.x), float(val.y)
+        try:
+            return float(val[0]), float(val[1])
+        except Exception:
+            return None
+
+    # --- mapeo simple de ACI (AutoCAD Color Index) a RGB ---
+    _ACI_TABLE = {
+        1:(255,0,0), 2:(255,255,0), 3:(0,255,0), 4:(0,255,255), 5:(0,0,255),
+        6:(255,0,255), 7:(255,255,255), 8:(128,128,128), 9:(192,192,192)
+    }
+    def aci_to_rgb_local(aci:int):
+        """Devuelve color RGB (0-255) aproximado para un índice ACI básico."""
+        return _ACI_TABLE.get(int(aci), (0,0,0))
+
+    def _rgb_from_entity(e):
+        tc = int(getattr(e.dxf, "true_color", 0) or 0)
+        if tc:
+            r = (tc >> 16) & 0xFF
+            g = (tc >> 8) & 0xFF
+            b = tc & 0xFF
+            return (r/255.0, g/255.0, b/255.0)
+        aci = int(getattr(e.dxf, "color", 256) or 256)
+        rgb = aci_to_rgb_local(aci)
+        return (rgb[0]/255.0, rgb[1]/255.0, rgb[2]/255.0)   
+
+    # 1) Paper Space
+    layout = doc.layouts.get(layout_name)
+    ctx    = RenderContext(doc)
+
+    fig = plt.figure(figsize=(11.69, 8.27))  # A4 apaisado
+    ax  = fig.add_axes([0, 0, 1, 1])
+    Frontend(ctx, MatplotlibBackend(ax)).draw_layout(layout)
+
+    # 2) Viewport principal (mayor área en papel)
+    vps = [e for e in layout if e.dxftype() == "VIEWPORT"]
+    if not vps:
+        fig.savefig(pdf_path, format="pdf", dpi=300)
+        plt.close(fig)
+        print(f"[OK] PDF (solo marco; sin viewports): {pdf_path}")
+        return
+
+    vp = max(vps, key=lambda v: float(v.dxf.width or 0) * float(v.dxf.height or 0))
+
+    # Tamaño/posición del rectángulo del viewport en papel
+    wp = float(vp.dxf.width or 0.0)
+    hp = float(vp.dxf.height or 0.0)
+    if wp <= 0.0 or hp <= 0.0:
+        fig.savefig(pdf_path, format="pdf", dpi=300)
+        plt.close(fig)
+        print(f"[OK] PDF (solo marco; viewport sin tamaño): {pdf_path}")
+        return
+
+    cxp, cyp = float(vp.dxf.center[0]), float(vp.dxf.center[1])
+    left, bottom = cxp - wp/2.0, cyp - hp/2.0
+
+    # Ventana del MODEL (centro y altura visibles en unidades de Model)
+    vcp = _xy(getattr(vp.dxf, "view_center_point", None))
+    vh  = float(getattr(vp.dxf, "view_height", 0.0) or 0.0)
+    if vcp is None or vh <= 0.0:
+        fig.savefig(pdf_path, format="pdf", dpi=300)
+        plt.close(fig)
+        print(f"[OK] PDF (solo marco; viewport sin centro/altura): {pdf_path}")
+        return
+    cxm, cym = vcp
+
+    # Transformación Model -> Papel (rectángulo del viewport)
+    aspect = wp / hp
+    vw     = vh * aspect               # ancho visible en model
+    xmin   = cxm - vw/2.0; xmax = cxm + vw/2.0
+    ymin   = cym - vh/2.0; ymax = cym + vh/2.0
+    sx     = wp / (xmax - xmin)
+    sy     = hp / (ymax - ymin)
+
+    def to_paper(x, y):
+        X = left + (x - xmin) * sx
+        Y = bottom + (y - ymin) * sy
+        return X, Y
+
+    # Clip rectangular (Cohen–Sutherland simplificado)
+    INSIDE, LEFT, RIGHT, BOTTOM, TOP = 0, 1, 2, 4, 8
+    def code(x, y):
+        c = INSIDE
+        if x < xmin: c |= LEFT
+        elif x > xmax: c |= RIGHT
+        if y < ymin: c |= BOTTOM
+        elif y > ymax: c |= TOP
+        return c
+
+    def clip_segment(p1, p2):
+        x1, y1 = p1; x2, y2 = p2
+        c1, c2 = code(x1, y1), code(x2, y2)
+        while True:
+            if (c1 | c2) == 0:      # ambos dentro
+                return (x1, y1), (x2, y2)
+            if (c1 & c2) != 0:      # comparten zona fuera
+                return None
+            c_out = c1 or c2
+            if c_out & TOP:
+                x = x1 + (x2 - x1) * (ymax - y1) / (y2 - y1); y = ymax
+            elif c_out & BOTTOM:
+                x = x1 + (x2 - x1) * (ymin - y1) / (y2 - y1); y = ymin
+            elif c_out & RIGHT:
+                y = y1 + (y2 - y1) * (xmax - x1) / (x2 - x1); x = xmax
+            else:  # LEFT
+                y = y1 + (y2 - y1) * (xmin - x1) / (x2 - x1); x = xmin
+            if c_out == c1:
+                x1, y1 = x, y; c1 = code(x1, y1)
+            else:
+                x2, y2 = x, y; c2 = code(x2, y2)
+
+    # 3) Dibuja LINE / LWPOLYLINE del Model en PAPEL, con color
+    any_drawn = False
+    msp = doc.modelspace()
+    for e in msp:
+        try:
+            if e.dxftype() == "LINE":
+                p1 = (float(e.dxf.start[0]), float(e.dxf.start[1]))
+                p2 = (float(e.dxf.end[0]),   float(e.dxf.end[1]))
+                seg = clip_segment(p1, p2)
+                if not seg:
+                    continue
+                (x1, y1), (x2, y2) = seg
+                X1, Y1 = to_paper(x1, y1)
+                X2, Y2 = to_paper(x2, y2)
+                ax.add_line(plt.Line2D([X1, X2], [Y1, Y2], linewidth=1.2, color=_rgb_from_entity(e)))
+                any_drawn = True
+
+            elif e.dxftype() == "LWPOLYLINE":
+                pts = [(float(p[0]), float(p[1])) for p in e.get_points()]
+                if len(pts) < 2:
+                    continue
+                col = _rgb_from_entity(e)
+                x_prev, y_prev = pts[0]
+                for (x, y) in pts[1:]:
+                    seg = clip_segment((x_prev, y_prev), (x, y))
+                    if seg:
+                        (xa, ya), (xb, yb) = seg
+                        Xa, Ya = to_paper(xa, ya)
+                        Xb, Yb = to_paper(xb, yb)
+                        ax.add_line(plt.Line2D([Xa, Xb], [Ya, Yb], linewidth=1.2, color=col))
+                        any_drawn = True
+                    x_prev, y_prev = x, y
+        except Exception:
+            continue
+
+    # 4) (opcional) dibujar el marco del viewport como guía visual
+    ax.add_patch(Rectangle((left, bottom), wp, hp, fill=False, linewidth=0.6))
+
+    # 5) Exporta
+    fig.savefig(pdf_path, format="pdf", dpi=300)
+    plt.close(fig)
+    print(f"[OK] {'PDF con viewport aplanado' if any_drawn else 'PDF (solo Paper Space; sin geometría visible en viewport)'}: {pdf_path}")
+
+def write_clean_dxf(lines_ll, polys_ll, bbox84, path):
+    doc = ezdxf.new("R2018")
+    ensure_layers(doc)
+    msp = doc.modelspace()
     for pts in lines_ll:
         if len(pts)==2: msp.add_line(pts[0], pts[1], dxfattribs={"layer":"LINES"})
         else:           msp.add_lwpolyline(pts, dxfattribs={"layer":"LINES"})
     for ring in polys_ll:
         if len(ring)>=3: msp.add_lwpolyline(ring, dxfattribs={"layer":"POLYGONS", "closed": True})
+    minlon, minlat, maxlon, maxlat = bbox84
+    doc.header['$EXTMIN'] = (minlon, minlat, 0.0)
+    doc.header['$EXTMAX'] = (maxlon, maxlat, 0.0)
+    doc.header['$INSUNITS'] = 0
+    doc.saveas(path)
+    print(f"[OK] DXF limpio: {path}")
 
-    # Norte simple + escala (texto) dentro del DXF
-    minlon, minlat, maxlon, maxlat = bbox_wgs84
-    width_deg  = maxlon - minlon
-    height_deg = maxlat - minlat
-    r = 0.04 * width_deg
-    cx = maxlon - 0.08*width_deg
-    cy = minlat + 0.85*height_deg
-    msp.add_circle((cx, cy), r, dxfattribs={"layer":"ANNOTATIONS"})
-    tri = [(cx, cy+r*0.95), (cx-r*0.6, cy-r*0.3), (cx+r*0.6, cy-r*0.3), (cx, cy+r*0.95)]
-    msp.add_lwpolyline(tri, dxfattribs={"layer":"ANNOTATIONS", "closed": True})
-    txt = msp.add_text("N", dxfattribs={"height": r*0.9, "layer": "ANNOTATIONS"})
-    txt.dxf.insert = (cx - r*0.25, cy - r*0.15)
-
-
-    msp.add_mtext("CRS: WGS84 (EPSG:4326)", dxfattribs={"layer":"ANNOTATIONS"}).set_location((minlon, minlat))
-    doc.saveas(dxf_path)
-
-# ==================== PRJ (EPSG:4326) ====================
-def write_prj_wgs84(prj_path):
-    try:
-        from pyproj import CRS
-        wkt = CRS.from_epsg(4326).to_wkt()
-    except Exception:
-        wkt = ('GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],'
-               'PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]')
-    with open(prj_path, "w", encoding="utf-8") as f:
-        f.write(wkt)
-
-# ==================== DWG vía ODA (opcional) ====================
 def try_convert_dxf_to_dwg(dxf_path, dwg_path):
     candidates = [
         "ODAFileConverter", "TeighaFileConverter",
@@ -203,10 +555,10 @@ def try_convert_dxf_to_dwg(dxf_path, dwg_path):
             exe = shutil.which(c) or c
             break
     if not exe:
-        print("[INFO] No se encontró ODA/Teigha File Converter. Se entrega DXF.")
+        print("[INFO] No se encontró ODA/Teigha. Se omite DWG.")
         return False
 
-    out_dir = os.path.dirname(os.path.abspath(dwg_path)) or "."
+    out_dir = os.path.dirname(os.path.abspath(dxf_path)) or "."
     in_dir  = os.path.dirname(os.path.abspath(dxf_path)) or "."
     print(f"[INFO] Convirtiendo DXF→DWG con: {exe}")
     cmd = [exe, in_dir, out_dir, "ACAD2018", "1", "1", ""]
@@ -216,210 +568,624 @@ def try_convert_dxf_to_dwg(dxf_path, dwg_path):
         if os.path.exists(maybe):
             if os.path.abspath(maybe) != os.path.abspath(dwg_path):
                 shutil.copy2(maybe, dwg_path)
-            print(f"[OK] Generado {dwg_path}")
+            print(f"[OK] DWG: {dwg_path}")
             return True
     except Exception as e:
-        print(f"[WARN] ODA converter falló: {e}")
+        print(f"[WARN] ODA falló: {e}")
     return False
 
-# ==================== PDF (UTM) ====================
-def meters_per_degree(lat_deg):
-    lat = math.radians(lat_deg)
-    m_per_deg_lat = 111132.92 - 559.82*math.cos(2*lat) + 1.175*math.cos(4*lat) - 0.0023*math.cos(6*lat)
-    m_per_deg_lon = 111412.84*math.cos(lat) - 93.5*math.cos(3*lat) + 0.118*math.cos(5*lat)
-    return m_per_deg_lon, m_per_deg_lat
+# --- NORMALIZAR AL ORIGEN (garantiza que Model abra centrado) ---
+def normalize_to_origin(lines_ll, polys_ll):
+    # centra el contenido en (0,0) restando el centro del bbox
+    xs = [x for g in (lines_ll + polys_ll) for x, y in g]
+    ys = [y for g in (lines_ll + polys_ll) for x, y in g]
+    if not xs or not ys:
+        return lines_ll, polys_ll, (0,0,0,0)
 
-def choose_nice_scale(den):
-    candidates = [500, 1000, 2000, 5000, 10000, 20000]
-    return min(candidates, key=lambda c: abs(c - den))
+    minx, miny, maxx, maxy = min(xs), min(ys), max(xs), max(ys)
+    cx = (minx + maxx) / 2.0
+    cy = (miny + maxy) / 2.0
 
-def compute_scale_denominator_m(bbox_m, fig_width_in):
-    minx, miny, maxx, maxy = bbox_m
-    ground_w = maxx - minx
-    paper_w = fig_width_in * 0.0254
-    if paper_w <= 0 or ground_w <= 0: return 1000
-    return max(1, int(round(ground_w / paper_w)))
+    def shift(seq): return [(x - cx, y - cy) for x, y in seq]
 
-def nice_scale_bar_length(den):
-    # que ocupe ~3 cm en papel
-    target = den * 0.03
-    nice = [10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000]
-    return min(nice, key=lambda x: abs(x - target))
+    lines0 = [shift(pts) for pts in lines_ll]
+    polys0 = [shift(r)   for r   in polys_ll]
 
-def draw_map_elements_utm(ax, bbox_m, zone_str):
-    """Leyenda pequeña, escala compacta y Norte nítido pegado a la esquina."""
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
-    from matplotlib.ticker import FormatStrFormatter
-    from PIL import Image
+    w = (maxx - minx); h = (maxy - miny)
+    bbox0 = (-w/2.0, -h/2.0, w/2.0, h/2.0)
+    return lines0, polys0, bbox0
 
-    minx, miny, maxx, maxy = bbox_m
-    dx = maxx - minx
-    dy = maxy - miny
+from datetime import datetime
+from zoneinfo import ZoneInfo  # Python 3.9+
 
-    # --- Ejes UTM con enteros (sin notación científica)
-    ax.ticklabel_format(style="plain", useOffset=False)
-    ax.xaxis.set_major_formatter(FormatStrFormatter('%.0f'))
-    ax.yaxis.set_major_formatter(FormatStrFormatter('%.0f'))
-    ax.set_xlabel(f"Easting (m) UTM {zone_str}")
-    ax.set_ylabel(f"Northing (m) UTM {zone_str}")
+def replace_placeholders(doc):
 
-        # ===================== LEYENDA (arriba-izq, corregida) =====================
-    leg = ax.inset_axes([0.015, 0.855, 0.145, 0.115])  # [x,y,w,h]
-    leg.axis("off")
-    leg.add_patch(Rectangle((0,0), 1, 1, fill=False, linewidth=0.8))
-    leg.text(0.5, 0.84, "LEYENDA", ha="center", va="center",
-             fontsize=5.5, fontweight="bold")
+    hoy = datetime.now(ZoneInfo("America/Lima")).strftime("%d/%m/%Y")
+    placeholders = {
+        "NOMBRE_DISTRITO": "Pendiente",
+        "NOMBRE_PROVINCIA": "Pendiente",
+        "NOMBRE_DEPARTAMENTO": "Pendiente",
+        "DD/MM/AAAA": hoy,
+    }
 
-    # línea azul (RED BITEL)
-    leg.add_line(plt.Line2D([0.10, 0.32], [0.63, 0.63], linewidth=1.8, color="#1f4fff"))
-    leg.text(0.38, 0.63, "RED BITEL", va="center", ha="left", fontsize=5.0)
-
-    # rectángulo fucsia (ÁREA DE PROYECTO) — centrado correctamente
-    # ahora el texto queda alineado al centro del cuadrado y con margen interno
-    leg.add_patch(Rectangle((0.10, 0.36), 0.16, 0.18, fill=False,
-                            linewidth=1.3, edgecolor="#ff00ff"))
-    leg.text(0.38, 0.45, "ÁREA DE PROYECTO", va="center", ha="left", fontsize=5.0)
-
-
-    # ===================== ESCALA (abajo-izq, compacta y separada) =====================
-    den = choose_nice_scale(compute_scale_denominator_m(bbox_m, fig_width_in=8.27))
-    bar_len_m = nice_scale_bar_length(den)
-
-    # Barra (no se superpone con el texto "ESC")
-    x0 = minx + 0.045 * dx
-    y0 = miny + 0.055 * dy
-    bar_h = 0.0020 * dy
-    ax.add_patch(Rectangle((x0, y0), bar_len_m, bar_h, color="black", zorder=4))
-
-    # textos de extremos (pequeños, con caja blanca)
-    ax.text(x0, y0 + 0.0045*dy, "0 m",
-            fontsize=5.0, ha="left", va="bottom",
-            bbox=dict(facecolor="white", edgecolor="none", pad=0.8), zorder=5)
-    ax.text(x0 + bar_len_m, y0 + 0.0045*dy, f"{bar_len_m} m",
-            fontsize=5.0, ha="right", va="bottom",
-            bbox=dict(facecolor="white", edgecolor="none", pad=0.8), zorder=5)
-
-    # “ESC 1/xxxx” en su propio inset (separado de la barra)
-    esc = ax.inset_axes([0.015, 0.020, 0.13, 0.050])  # más chico y alejado
-    esc.axis("off")
-    esc.add_patch(Rectangle((0.00, 0.25), 0.07, 0.50, color="black"))
-    esc.text(0.09, 0.26, f"ESC 1/{den}", fontsize=6.0, va="bottom")
-
-    # ===================== NORTE (arriba-derecha EXACTAMENTE en la esquina) =====================
-    pad = 0.006
-    w = h = 0.11
-    x = 1.0 - pad - w
-    y = 1.0 - pad - h
-
-    if os.path.exists(NORTH_PNG):
-        n_ax = ax.inset_axes([x, y, w, h])
-        n_ax.axis("off")
-
-        # Mejora de nitidez: reescala x3 con LANCZOS antes de insertar
-        try:
-            img = Image.open(NORTH_PNG)
-            img = img.resize((img.width*3, img.height*3), Image.LANCZOS)
-            n_ax.imshow(img)
-        except Exception:
-            n_ax.imshow(Image.open(NORTH_PNG))
-    else:
-        # fallback vectorial
-        r = 0.09 * dx
-        cx = maxx - pad*dx - 0.5*w*dx
-        cy = maxy - pad*dy - 0.5*h*dy
-        circ = plt.Circle((cx, cy), r, fill=False, linewidth=1.2, color="black")
-        ax.add_patch(circ)
-        tx = [cx, cx - r*0.6, cx + r*0.6, cx]
-        ty = [cy + r*0.95, cy - r*0.3,  cy - r*0.3, cy + r*0.95]
-        ax.plot(tx, ty, color="black", linewidth=1.2)
-        ax.text(cx, cy - r*0.55, "N", ha="center", va="center",
-                fontsize=9.0, fontweight="bold", color="black")
-
-
-def safe_save_pdf(fig, path):
-    base, ext = os.path.splitext(path)
-    if ext.lower() != ".pdf":
-        ext = ".pdf"
-    tmp = f"{base}.tmp{ext}"
-    try:
-        fig.savefig(tmp, format="pdf", bbox_inches="tight")
-        os.replace(tmp, path)
-        print(f"[OK] PDF: {path}")
-        return
-    except PermissionError:
-        for i in range(1, 50):
-            alt = f"{base}_{i}{ext}"
+    for layout in doc.layouts:
+        for e in layout:
             try:
-                fig.savefig(alt, format="pdf", bbox_inches="tight")
-                print(f"[WARN] {path} en uso. Guardado como: {alt}")
-                return
-            except PermissionError:
+                if e.dxftype() == "TEXT":
+                    txt = e.dxf.text or ""
+                    new_txt = txt
+                    for k, v in placeholders.items():
+                        if k in new_txt:
+                            new_txt = new_txt.replace(k, v)
+                    if new_txt != txt:
+                        e.dxf.text = new_txt
+
+                elif e.dxftype() == "MTEXT":
+                    txt = e.text or ""
+                    new_txt = txt
+                    for k, v in placeholders.items():
+                        if k in new_txt:
+                            new_txt = new_txt.replace(k, v)
+                    if new_txt != txt:
+                        e.text = new_txt
+            except Exception:
                 continue
-        print("[ERROR] No se pudo escribir el PDF (archivo bloqueado).")
-    finally:
-        if os.path.exists(tmp):
-            try: os.remove(tmp)
-            except Exception: pass
 
-def render_pdf_utm(lines_ll, polys_ll, bbox_ll, pdf_path, title_text):
-    # Proyectar a UTM y añadir margen 10%:
-    lines_e, polys_e, bbox_m, zone_str = project_to_utm(lines_ll, polys_ll, bbox_ll)
-    minx, miny, maxx, maxy = bbox_m
+def upsert_utm_4lines(
+    doc,
+    layout_name,
+    offset_lonlat,
+    layer_name="GRID_UTM",
+    lineweight=7,                 # mitad del grosor anterior (≈0.07 mm)
+    text_h=2.5,
+    label_gap=2.0,                # separación para rótulos X (arriba/abajo)
+    y_label_inset=3.0,            # rótulos del eje Y un poco hacia adentro
+    frame_rect=None,              # (xmin, ymin, xmax, ymax) del marco de tu plantilla
+    epsg_override=None,
+    zone_override=None,
+    south_override=None,
+):
+    """
+    Dibuja 4 líneas UTM verticales y 4 horizontales que
+    se EXTiENDEN hasta el marco de la plantilla (frame_rect).
+    - Rótulos X arriba/abajo del marco.
+    - Rótulos Y dentro del marco (inset).
+    Requiere: pyproj
+    """
+    try:
+        from pyproj import Transformer
+        from ezdxf.math import Vec2, Vec3
+    except Exception:
+        print("[WARN] Falta pyproj (pip install pyproj).")
+        return
 
-    fig = plt.figure(figsize=(11.69, 8.27))  # A4 apaisado para mayor área útil
-    ax = fig.add_subplot(111)
+    def _xy(val):
+        if val is None: return None
+        if isinstance(val, (Vec2, Vec3)): return float(val.x), float(val.y)
+        try: return float(val[0]), float(val[1])
+        except Exception: return None
 
-    # Dibujar vectores UTM
-    for pts in lines_e:
-        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-        ax.plot(xs, ys, linewidth=2.2, color="#1f4fff")
-    for ring in polys_e:
-        xs = [p[0] for p in ring]; ys = [p[1] for p in ring]
-        ax.plot(xs, ys, linewidth=1.6, color="#ff00ff")
+    if layout_name not in doc.layouts:
+        print(f"[WARN] Layout '{layout_name}' no existe.")
+        return
+    layout = doc.layouts.get(layout_name)
 
-    ax.set_aspect('equal', adjustable='box')
-    ax.set_xlim([minx, maxx]); ax.set_ylim([miny, maxy])
-    ax.set_title(title_text)
-    ax.grid(True, linestyle="--", linewidth=0.3)
+    vps = [e for e in layout if e.dxftype() == "VIEWPORT"]
+    if not vps:
+        print("[WARN] Layout sin VIEWPORTs.")
+        return
+    vp = max(vps, key=lambda v: float(v.dxf.width or 0) * float(v.dxf.height or 0))
 
-    draw_map_elements_utm(ax, bbox_m, zone_str)
+    # Rectángulo del viewport en PAPEL (mm)
+    wp = float(vp.dxf.width or 0.0); hp = float(vp.dxf.height or 0.0)
+    if wp <= 0.0 or hp <= 0.0:
+        print("[WARN] VIEWPORT sin tamaño.")
+        return
+    cxp, cyp = float(vp.dxf.center[0]), float(vp.dxf.center[1])
+    v_left, v_bottom = cxp - wp/2.0, cyp - hp/2.0
+    v_right, v_top   = v_left + wp, v_bottom + hp
 
-    safe_save_pdf(fig, pdf_path)
-    plt.close(fig)
+    # Marco de la plantilla (si no lo das, usa el rectángulo del viewport)
+    if frame_rect is None:
+        f_left, f_bottom, f_right, f_top = v_left, v_bottom, v_right, v_top
+    else:
+        f_left, f_bottom, f_right, f_top = map(float, frame_rect)
 
-# ==================== MAIN ====================
+    # Ventana visible del MODEL
+    vcp = _xy(getattr(vp.dxf, "view_center_point", None))
+    vh  = float(getattr(vp.dxf, "view_height", 0.0) or 0.0)
+    if vcp is None or vh <= 0.0:
+        print("[WARN] VIEWPORT sin view_center_point/view_height válidos.")
+        return
+    cxm, cym = vcp
+    aspect = wp / hp
+    vw = vh * aspect
+    xmin = cxm - vw/2.0; xmax = cxm + vw/2.0
+    ymin = cym - vh/2.0; ymax = cym + vh/2.0
+
+    # Revertir normalización a lon/lat reales
+    off_lon, off_lat = offset_lonlat
+    lon_center = cxm + off_lon
+    lat_center = cym + off_lat
+
+    # Selección de CRS
+    if epsg_override is not None:
+        epsg = int(epsg_override); zone = None; south = None
+    else:
+        if zone_override is not None:
+            zone = int(zone_override)
+            south = bool(south_override) if south_override is not None else (lat_center < 0)
+        else:
+            zone = int((lon_center + 180) // 6 + 1)
+            south = (lat_center < 0)
+        epsg = 32700 + zone if south else 32600 + zone
+
+    tr = Transformer.from_crs(4326, epsg, always_xy=True)
+
+    # Transformación Model→Papel (a coordenadas del viewport)
+    sx = wp / (xmax - xmin)
+    sy = hp / (ymax - ymin)
+    def to_paper(x, y):
+        return (v_left + (x - xmin) * sx, v_bottom + (y - ymin) * sy)
+
+    # Limpia la capa previa
+    if layer_name not in doc.layers:
+        doc.layers.add(layer_name, color=8)  # gris
+    for e in list(layout):
+        try:
+            if (e.dxf.layer or "") == layer_name:
+                e.destroy()
+        except Exception:
+            pass
+
+    # Fracciones internas: siempre 4
+    fracs = [1/5, 2/5, 3/5, 4/5]
+
+    # Utilidades de texto
+    def add_mtext_center(pt, s, attach="TOP_CENTER"):
+        ap_map = {
+            "TOP_LEFT":1, "TOP_CENTER":2, "TOP_RIGHT":3,
+            "MIDDLE_LEFT":4, "MIDDLE_CENTER":5, "MIDDLE_RIGHT":6,
+            "BOTTOM_LEFT":7, "BOTTOM_CENTER":8, "BOTTOM_RIGHT":9,
+        }
+        m = layout.add_mtext(s, dxfattribs={"layer": layer_name, "char_height": text_h})
+        m.set_location(pt, attachment_point=ap_map.get(attach, 2))
+
+    def add_text_rotated(pt, s, deg=90.0):
+        t = layout.add_text(s, dxfattribs={"layer": layer_name, "height": text_h, "rotation": float(deg)})
+        t.dxf.insert = pt
+
+    # 1) 4 verticales (Easting): prolongadas hasta el marco
+    for f in fracs:
+        x_model = xmin + f * (xmax - xmin)
+        Xv, _ = to_paper(x_model, ymin)   # solo necesitamos X en papel
+
+        # Línea desde el borde inferior del marco hasta el superior del marco
+        layout.add_line((Xv, f_bottom), (Xv, f_top),
+                        dxfattribs={"layer": layer_name, "lineweight": lineweight})
+
+        # Etiquetas UTM (E) arriba/abajo del marco
+        E, _N = tr.transform(x_model + off_lon, lat_center)
+        label = f"{int(round(E))}"
+        add_mtext_center((Xv, f_top + label_gap), label, attach="TOP_CENTER")
+        add_mtext_center((Xv, f_bottom - label_gap), label, attach="BOTTOM_CENTER")
+
+    # 2) 4 horizontales (Northing): prolongadas hasta el marco
+    for f in fracs:
+        y_model = ymin + f * (ymax - ymin)
+        _, Yh = to_paper(xmin, y_model)   # solo necesitamos Y en papel
+
+        layout.add_line((f_left, Yh), (f_right, Yh),
+                        dxfattribs={"layer": layer_name, "lineweight": lineweight})
+
+        # Etiquetas UTM (N) dentro del marco (inset)
+        _E, N = tr.transform(lon_center, y_model + off_lat)
+        label = f"{int(round(N))}"
+        add_text_rotated((f_left + y_label_inset,  Yh), label, deg=90.0)
+        add_text_rotated((f_right - y_label_inset, Yh), label, deg=90.0)
+
+    # Leyenda de zona/epsg (opcional)
+    if zone_override is not None:
+        ztxt = f"UTM {zone}{'S' if south else 'N'} (EPSG:{epsg})"
+    else:
+        z = int((lon_center + 180) // 6 + 1); s = lat_center < 0
+        ztxt = f"UTM {z}{'S' if s else 'N'} (EPSG:{epsg})"
+
+    zone_text = f"{zone}{'S' if south else 'N'}" if zone else "?"
+    set_zone_utm_in_layout(doc, layout_name, zone_text)
+
+
+import re
+from ezdxf.math import Vec2, Vec3
+
+def _xy2(val):
+    if val is None: return None
+    if isinstance(val, (Vec2, Vec3)): return float(val.x), float(val.y)
+    try: return float(val[0]), float(val[1])
+    except Exception: return None
+
+def compute_scale_1_to_n(doc, layout_name, offset_lonlat, epsg_override=None):
+    """
+    Devuelve (n, info) donde la escala es 1:n, calculada en UTM a partir
+    del viewport principal del layout.
+    """
+    try:
+        from pyproj import Transformer
+    except Exception:
+        print("[WARN] Falta pyproj (pip install pyproj) → no se puede calcular escala.")
+        return None, {}
+
+    if layout_name not in doc.layouts:
+        print(f"[WARN] Layout '{layout_name}' no existe.")
+        return None, {}
+
+    layout = doc.layouts.get(layout_name)
+    vps = [e for e in layout if e.dxftype() == "VIEWPORT"]
+    if not vps:
+        print("[WARN] Layout sin VIEWPORTs.")
+        return None, {}
+
+    # Viewport principal (mayor área)
+    vp = max(vps, key=lambda v: float(v.dxf.width or 0) * float(v.dxf.height or 0))
+
+    # Tamaño del rectángulo de viewport en papel (mm)
+    wp = float(vp.dxf.width or 0.0)
+    hp = float(vp.dxf.height or 0.0)
+    if wp <= 0 or hp <= 0:
+        print("[WARN] VIEWPORT sin tamaño.")
+        return None, {}
+
+    # Ventana en Model
+    vcp = _xy2(getattr(vp.dxf, "view_center_point", None))
+    vh  = float(getattr(vp.dxf, "view_height", 0.0) or 0.0)
+    if vcp is None or vh <= 0.0:
+        print("[WARN] VIEWPORT sin center/height.")
+        return None, {}
+    cxm, cym = vcp
+    aspect = wp / hp
+    vw     = vh * aspect
+
+    xmin = cxm - vw/2.0; xmax = cxm + vw/2.0
+    ymin = cym - vh/2.0; ymax = cym + vh/2.0
+
+    # Pasar de coords locales (si SHIFT_TO_LOCAL=True) a lon/lat reales
+    off_lon, off_lat = offset_lonlat
+    # Usamos el centro para determinar zona UTM automáticamente (salvo override)
+    lon_center = (xmin + xmax)/2.0 + off_lon
+    lat_center = (ymin + ymax)/2.0 + off_lat
+
+    if epsg_override:
+        epsg   = int(epsg_override)
+        zone   = None
+        south  = lat_center < 0
+    else:
+        zone   = int((lon_center + 180.0)//6 + 1)
+        south  = lat_center < 0
+        epsg   = (32700 if south else 32600) + zone
+
+    tr = Transformer.from_crs(4326, epsg, always_xy=True)
+
+    # Proyectamos el rectángulo visible del MODEL a UTM (metros)
+    lx, by = tr.transform(xmin + off_lon, ymin + off_lat)
+    rx, ty = tr.transform(xmax + off_lon, ymax + off_lat)
+
+    width_m  = abs(rx - lx)
+    height_m = abs(ty - by)
+
+    if width_m <= 0 or height_m <= 0:
+        return None, {}
+
+    # Escala 1:n (conservadora: usa el eje “más exigente”)
+    n_w = (width_m  / wp) * 1000.0   # m/mm → *1000
+    n_h = (height_m / hp) * 1000.0
+    n   = int(max(n_w, n_h) + 0.5)   # redondeo al entero
+
+    info = {"epsg": epsg, "zone": zone, "south": south,
+            "width_m": width_m, "height_m": height_m,
+            "wp_mm": wp, "hp_mm": hp}
+    return n, info
+
+import re
+
+_ESC_RE   = re.compile(r"ESC\s*1\s*/\s*\d+", flags=re.IGNORECASE)
+_ONLYVAL  = re.compile(r"^\s*1\s*/\s*\d+\s*$", flags=re.IGNORECASE)
+_ESCALA_RE = re.compile(r"ESCALA", flags=re.IGNORECASE)  # para no tocar 'ESCALA:'
+
+def apply_scale_text(doc, layout_name, scale_n):
+    """
+    Reemplaza de forma idempotente:
+      - 'ESC 1/####' → 'ESC 1/<scale_n>'
+      - Si un texto es EXACTAMENTE '1/####' → '1/<scale_n>'
+    No toca nada que contenga 'ESCALA'.
+    """
+    if layout_name not in doc.layouts:
+        return 0
+    layout = doc.layouts.get(layout_name)
+
+    new_full = f"ESC 1/{int(scale_n)}"
+    new_val  = f"1/{int(scale_n)}"
+
+    changed = 0
+
+    def _patch_string(s):
+        # No tocar rótulos “ESCALA: …”
+        if _ESCALA_RE.search(s or ""):
+            return s, False
+        # 1) Sustituir solo la porción 'ESC 1/####' si existe
+        if _ESC_RE.search(s or ""):
+            s2 = _ESC_RE.sub(new_full, s)
+            return s2, (s2 != s)
+        # 2) Si el texto es exactamente '1/####', reemplazarlo
+        if _ONLYVAL.match(s or ""):
+            return new_val, True
+        return s, False
+
+    for e in layout:
+        try:
+            if e.dxftype() == "TEXT":
+                s = e.dxf.text or ""
+                s2, did = _patch_string(s)
+                if did:
+                    e.dxf.text = s2
+                    changed += 1
+            elif e.dxftype() == "MTEXT":
+                s = e.text or ""
+                s2, did = _patch_string(s)
+                if did:
+                    e.text = s2
+                    changed += 1
+        except Exception:
+            pass
+
+    # Atributos de bloques (INSERT/ATTRIB), muy común en cartelas
+    try:
+        for ins in layout.query("INSERT"):
+            for att in getattr(ins, "attribs", []):
+                s = att.dxf.text or ""
+                s2, did = _patch_string(s)
+                if did:
+                    att.dxf.text = s2
+                    changed += 1
+    except Exception:
+        pass
+
+    return changed
+
+import re
+
+def set_zone_utm_in_layout(doc, layout_name, zone_text):
+    """
+    Reemplaza el token 'ZONA_UTM' por <zone_text> en:
+      - TEXT (e.dxf.text)
+      - MTEXT (e.text)
+      - Atributos de INSERT (ATTRIB)
+    Coincidencia insensible a mayúsculas y por substring.
+    """
+    token = "ZONA_UTM"
+    pat = re.compile(re.escape(token), flags=re.IGNORECASE)
+
+    if layout_name not in doc.layouts:
+        return 0
+
+    layout = doc.layouts.get(layout_name)
+    changed = 0
+
+    # TEXT / MTEXT en el Paper Space
+    for e in layout:
+        try:
+            if e.dxftype() == "TEXT":
+                s = e.dxf.text or ""
+                s2 = pat.sub(zone_text, s)
+                if s2 != s:
+                    e.dxf.text = s2
+                    changed += 1
+            elif e.dxftype() == "MTEXT":
+                s = e.text or ""
+                s2 = pat.sub(zone_text, s)
+                if s2 != s:
+                    e.text = s2
+                    changed += 1
+        except Exception:
+            pass
+
+    # Atributos de bloques (muy típico en cartelas)
+    try:
+        for ins in layout.query("INSERT"):
+            for att in getattr(ins, "attribs", []):
+                s = att.dxf.text or ""
+                s2 = pat.sub(zone_text, s)
+                if s2 != s:
+                    att.dxf.text = s2
+                    changed += 1
+    except Exception:
+        pass
+
+    return changed
+
+# --- Escalas estándar ---
+STD_SCALES = (500, 1000, 2000, 5000, 10000, 25000, 50000)
+
+def _ensure_frame_viewport(doc, layout_name, frame_rect):
+    """Crea (o reemplaza) un VIEWPORT que ocupe exactamente frame_rect en papel."""
+    layout = doc.layouts.get(layout_name)
+    # borra el mayor viewport si existe
+    for e in list(layout):
+        try:
+            if e.dxftype() == "VIEWPORT":
+                e.destroy()
+        except Exception:
+            pass
+    x0, y0, x1, y1 = map(float, frame_rect)
+    center = ((x0+x1)/2.0, (y0+y1)/2.0)
+    size   = (x1-x0, y1-y0)
+    # crea un viewport “en blanco”; view_center/height se setean luego
+    vp = layout.add_viewport(center=center, size=size, view_center_point=(0.0, 0.0), view_height=1.0)
+    try: vp.dxf.status = 1
+    except Exception: pass
+    return vp
+
+def apply_best_standard_scale(doc, layout_name, offset_lonlat, frame_rect,
+                              standards=STD_SCALES, epsg_override=None):
+    """
+    1) Calcula la escala mínima necesaria (1:n_req) para que el bbox actual entre.
+    2) Elige la escala estándar más cercana por arriba (la más grande que quepa).
+    3) Ajusta el VIEWPORT para que esa escala sea exacta en el marco dado.
+    4) Devuelve (n_elegida, info).
+    """
+    from pyproj import Transformer
+
+    # Asegura un viewport exactamente del tamaño del marco
+    vp = _ensure_frame_viewport(doc, layout_name, frame_rect)
+    x0, y0, x1, y1 = map(float, frame_rect)
+    wp, hp = (x1-x0), (y1-y0)  # mm de papel
+
+    # Lee centro/altura actuales del model (si no hay, usa 0,0)
+    try:
+        cxm, cym = vp.dxf.view_center_point
+    except Exception:
+        cxm, cym = 0.0, 0.0
+
+    # 1) escala mínima requerida con tu función existente
+    n_req, info = compute_scale_1_to_n(doc, layout_name, offset_lonlat, epsg_override=epsg_override)
+    if not n_req:
+        n_req = standards[0]
+
+    # 2) elige estándar
+    choose = None
+    for s in standards:
+        if s >= n_req:
+            choose = s
+            break
+    if choose is None:
+        choose = standards[-1]
+
+    # 3) fija el viewport a esa escala exacta (geom. en lon/lat → UTM → lon/lat)
+    off_lon, off_lat = offset_lonlat
+    lon_c = cxm + off_lon
+    lat_c = cym + off_lat
+
+    if epsg_override:
+        epsg = int(epsg_override)
+    else:
+        zone  = int((lon_c + 180)//6 + 1)
+        south = lat_c < 0
+        epsg  = (32700 if south else 32600) + zone
+
+    tr_fwd = Transformer.from_crs(4326, epsg, always_xy=True)   # lon/lat → UTM
+    tr_inv = Transformer.from_crs(epsg, 4326, always_xy=True)   # UTM → lon/lat
+
+    # ancho/alto reales que debe “ver” el viewport (en metros)
+    width_m  = (wp/1000.0) * choose
+    height_m = (hp/1000.0) * choose
+
+    # construye rectángulo UTM alrededor del centro
+    Ex, Ny   = tr_fwd.transform(lon_c, lat_c)
+    Ex0, Ex1 = Ex - width_m/2.0,  Ex + width_m/2.0
+    Ny0, Ny1 = Ny - height_m/2.0, Ny + height_m/2.0
+
+    # vuelve a lon/lat para obtener altura en grados (AutoCAD usa “view_height”)
+    lon_bot, lat_bot = tr_inv.transform(Ex,  Ny0)  # centro abajo
+    lon_top, lat_top = tr_inv.transform(Ex,  Ny1)  # centro arriba
+    view_h_deg = max(lat_top - lat_bot, 1e-9)
+
+    # fija centro y altura (en coords del MODEL: restando el offset)
+    vp.dxf.view_center_point = (lon_c - off_lon, lat_c - off_lat)
+    vp.dxf.view_height       = view_h_deg
+
+    # Asegura capas ON
+    try:
+        for lname in ("LINES","POLYGONS"):
+            L = doc.layers.get(lname); L.on(); L.thaw(); L.unlock()
+            if hasattr(vp,"is_layer_frozen") and vp.is_layer_frozen(lname):
+                vp.thaw_layer(lname)
+    except Exception:
+        pass
+
+    return choose, info
+
+# ───────── MAIN ─────────
 def main():
     if not os.path.exists(KMZ_NAME):
-        print(f"[ERROR] No encuentro {KMZ_NAME} en esta carpeta.")
+        print(f"[ERROR] Falta {KMZ_NAME}")
+        return
+    if not os.path.exists(TEMPLATE_DXF_IN):
+        print(f"[ERROR] Falta {TEMPLATE_DXF_IN} (guarda tu plantilla como AutoCAD 2018 DXF)")
         return
 
-    print("[INFO] Leyendo geometrías del KMZ (WGS84)…")
-    lines_ll, polys_ll = read_geometries_wgs84(KMZ_NAME)
-    if not lines_ll and not polys_ll:
-        print("[ERROR] El KMZ no contiene LineString ni Polygon utilizables.")
+    print("[INFO] Leyendo KMZ con colores…")
+    lines_col, polys_col = read_geometries_wgs84_colored(KMZ_NAME)
+    if not lines_col and not polys_col:
+        print("[ERROR] KMZ sin geometrías utilizables.")
         return
 
-    # BBox WGS84 (para DXF y para proyectar a UTM)
-    lons = [lon for g in (lines_ll + polys_ll) for lon,lat in g]
-    lats = [lat for g in (lines_ll + polys_ll) for lon,lat in g]
+    # BBOX WGS84 base (en lon/lat) para referencia
+    lons = [x for (pts, _rgb) in (lines_col + polys_col) for x, y in pts]
+    lats = [y for (pts, _rgb) in (lines_col + polys_col) for x, y in pts]
     bbox84 = bbox_wgs84(lons, lats, margin_ratio=0.06)
 
-    print("[INFO] Creando DXF (WGS84)…")
-    make_dxf_wgs84(lines_ll, polys_ll, DXF_OUT, PNG_W84, bbox84)
-    print(f"[OK] DXF: {DXF_OUT}")
+    # 1) Elegir sistema para insertar en la PLANTILLA:
+    if SHIFT_TO_LOCAL:
+        lines_ins, polys_ins, bbox_ins, offset = shift_to_local_coords_colored(lines_col, polys_col)
+        print(f"[INFO] Normalizado al origen (offset lon/lat = {offset})")
+    else:
+        lines_ins, polys_ins, bbox_ins, offset = lines_col, polys_col, bbox84, (0.0, 0.0)
 
-    print("[INFO] Escribiendo PRJ (EPSG:4326)…")
-    write_prj_wgs84(PRJ_OUT)
-    print(f"[OK] PRJ: {PRJ_OUT}")
+    # 2) Plantilla + reemplazo Model (respetando color)
+    print("[INFO] Abriendo plantilla DXF…")
+    doc = ezdxf.readfile(TEMPLATE_DXF_IN)
+    replace_placeholders(doc)
+    replace_model_content(doc, lines_ins, polys_ins, bbox_ins)
 
-    print("[INFO] Intentando convertir a DWG (si ODA/Teigha está instalado)…")
-    converted = try_convert_dxf_to_dwg(DXF_OUT, DWG_OUT)
-    print("[OK] DWG generado." if converted else "[AVISO] No se generó DWG automáticamente. Se entrega DXF.")
+    # 3) Centrar la vista del Model (zoom extents portátil)
+    center_model_view(doc, bbox_ins, pad=1.02)
 
-    print("[INFO] Renderizando PDF (UTM)…")
-    render_pdf_utm(lines_ll, polys_ll, bbox84, PDF_OUT, "INFORMACIÓN DE RUTAS ACTUALES")
-    print("[OK] Proceso finalizado.")
+    # 4) Encajar el VIEWPORT exactamente en el marco útil
+    fit_layout_viewport(
+        doc, LAYOUT_NAME, bbox_ins,
+        occupancy=0.58, safety=1.00,
+        frame_rect=PAPER_FRAME_RECT  # (xmin, ymin, xmax, ymax) en PAPEL
+    )
+
+    # 5) Buscar la mejor escala ESTÁNDAR que quepa y aplicarla al viewport
+    best_n, info = apply_best_standard_scale(
+        doc, LAYOUT_NAME, offset, frame_rect=PAPER_FRAME_RECT
+    )
+    print(f"[INFO] Escala estándar seleccionada: 1:{best_n}")
+
+    # 6) Dibujar 4x4 líneas y rótulos UTM dentro del marco
+    upsert_utm_4lines(doc, LAYOUT_NAME, offset, frame_rect=PAPER_FRAME_RECT)
+
+    # 7) Sustituir ZONA_UTM en la cartela usando la zona detectada/derivada
+    zone = info.get("zone"); south = info.get("south"); epsg = info.get("epsg")
+    if zone is None and epsg:
+        if 32601 <= epsg <= 32660: zone, south = epsg - 32600, False
+        elif 32701 <= epsg <= 32760: zone, south = epsg - 32700, True
+    zone_text = f"{zone}{'S' if south else 'N'}" if zone else "?"
+    set_zone_utm_in_layout(doc, LAYOUT_NAME, zone_text)
+    print(f"[INFO] Zona UTM: {zone_text} (EPSG:{epsg})")
+
+    # 8) Escribir la escala en textos 'ESC 1/####' (solo una vez; no toca 'ESCALA:')
+    cnt = apply_scale_text(doc, LAYOUT_NAME, best_n)
+    print(f"[INFO] Textos 'ESC' actualizados: {cnt}")
+
+    # 9) Guardar DXF final
+    doc.saveas(FINAL_DXF_OUT)
+    print(f"[OK] Plantilla final: {FINAL_DXF_OUT}")
+
+    # 10) Reabrir solo para exportar PDF tal cual se ve el layout
+    doc = ezdxf.readfile(FINAL_DXF_OUT)
+    fit_layout_viewport(
+        doc, LAYOUT_NAME, bbox_ins,
+        occupancy=0.58, safety=1.00,
+        frame_rect=PAPER_FRAME_RECT
+    )
+    upsert_utm_4lines(doc, LAYOUT_NAME, offset, frame_rect=PAPER_FRAME_RECT)
+    set_zone_utm_in_layout(doc, LAYOUT_NAME, zone_text)  # idempotente
+
+    export_layout_pdf_viewport(doc, LAYOUT_NAME, PDF_OUT)
+    print(f"[OK] PDF: {PDF_OUT}")
+    print("[OK] Proceso completo.")
+
 
 if __name__ == "__main__":
     main()
