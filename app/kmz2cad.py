@@ -25,6 +25,45 @@ for p,u in NS.items():
     ET.register_namespace("" if p=="kml" else p, u)
 
 # ───────── Utilidades KML ─────────
+# --- Admin meta (UBIGEO/DEP/PROV/DIST) -------------------
+import json
+
+def load_admin_meta(base_dir: str = "."):
+    """
+    Intenta leer ./meta.json con:
+      { "ubigeo": "...", "departamento": "...", "provincia": "...", "distrito": "..." }
+    Si no existe, usa variables de entorno (UBIGEO, DEPARTAMENTO, PROVINCIA, DISTRITO).
+    Nunca lanza excepción; siempre devuelve un dict con strings.
+    """
+    meta = {
+        "ubigeo": "",
+        "departamento": "",
+        "provincia": "",
+        "distrito": "",
+    }
+
+    # 1) meta.json (preferencia)
+    try:
+        p = os.path.join(base_dir, "meta.json")
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+                meta.update({k: (str(data.get(k, "") or "")).strip() for k in meta.keys()})
+    except Exception as e:
+        print(f"[WARN] meta.json no legible: {e}")
+
+    # 2) ENV (rellena vacíos)
+    meta["ubigeo"]       = (os.getenv("UBIGEO",       meta["ubigeo"]) or "").strip()
+    meta["departamento"] = (os.getenv("DEPARTAMENTO", meta["departamento"]) or "").strip()
+    meta["provincia"]    = (os.getenv("PROVINCIA",    meta["provincia"]) or "").strip()
+    meta["distrito"]     = (os.getenv("DISTRITO",     meta["distrito"]) or "").strip()
+
+    # Normaliza UBIGEO a 6 dígitos si es numérico
+    if meta["ubigeo"].isdigit():
+        meta["ubigeo"] = meta["ubigeo"].zfill(6)
+
+    return meta
+
 def parse_coords(text):
     out=[]
     if not text: return out
@@ -601,13 +640,34 @@ def normalize_to_origin(lines_ll, polys_ll):
 from datetime import datetime
 from zoneinfo import ZoneInfo  # Python 3.9+
 
-def replace_placeholders(doc):
+from datetime import datetime
+from zoneinfo import ZoneInfo  # Python 3.9+
+
+def replace_placeholders(doc, meta=None):
+    """
+    Reemplaza tokens en la plantilla. Si 'meta' viene vacío o falta,
+    usa 'Pendiente' para los nombres y deja UBIGEO tal cual (o vacío).
+    Tokens soportados:
+      - NOMBRE_DISTRITO
+      - NOMBRE_PROVINCIA
+      - NOMBRE_DEPARTAMENTO
+      - UBIGEO
+      - DD/MM/AAAA (fecha actual Lima)
+    """
+    if meta is None:
+        meta = {}
+
+    distrito     = (meta.get("distrito") or "Pendiente").strip()
+    provincia    = (meta.get("provincia") or "Pendiente").strip()
+    departamento = (meta.get("departamento") or "Pendiente").strip()
+    ubigeo       = (meta.get("ubigeo") or "").strip()
 
     hoy = datetime.now(ZoneInfo("America/Lima")).strftime("%d/%m/%Y")
-    placeholders = {
-        "NOMBRE_DISTRITO": "Pendiente",
-        "NOMBRE_PROVINCIA": "Pendiente",
-        "NOMBRE_DEPARTAMENTO": "Pendiente",
+    tokens = {
+        "NOMBRE_DISTRITO": distrito,
+        "NOMBRE_PROVINCIA": provincia,
+        "NOMBRE_DEPARTAMENTO": departamento,
+        "UBIGEO": ubigeo,
         "DD/MM/AAAA": hoy,
     }
 
@@ -617,7 +677,7 @@ def replace_placeholders(doc):
                 if e.dxftype() == "TEXT":
                     txt = e.dxf.text or ""
                     new_txt = txt
-                    for k, v in placeholders.items():
+                    for k, v in tokens.items():
                         if k in new_txt:
                             new_txt = new_txt.replace(k, v)
                     if new_txt != txt:
@@ -626,13 +686,14 @@ def replace_placeholders(doc):
                 elif e.dxftype() == "MTEXT":
                     txt = e.text or ""
                     new_txt = txt
-                    for k, v in placeholders.items():
+                    for k, v in tokens.items():
                         if k in new_txt:
                             new_txt = new_txt.replace(k, v)
                     if new_txt != txt:
                         e.text = new_txt
             except Exception:
                 continue
+
 
 def upsert_utm_4lines(
     doc,
@@ -1266,8 +1327,18 @@ def main():
     # 2) Plantilla + reemplazo Model (respetando color)
     print("[INFO] Abriendo plantilla DXF…")
     doc = ezdxf.readfile(TEMPLATE_DXF_IN)
-    replace_placeholders(doc)
+
+    # Lee meta desde ./meta.json o ENV; si no hay, no rompe
+    meta = load_admin_meta(".")
+    if any(meta.values()):
+        print(f"[INFO] Meta recibida: UBIGEO={meta.get('ubigeo')}, "
+            f"DEP={meta.get('departamento')}, PROV={meta.get('provincia')}, DIST={meta.get('distrito')}")
+    else:
+        print("[INFO] Sin meta (ejecución local). Se usarán valores 'Pendiente' en cartela.")
+
+    replace_placeholders(doc, meta)  # <-- ahora con meta
     replace_model_content(doc, lines_ins, polys_ins, bbox_ins)
+
 
     # 3) Centrar la vista del Model (zoom extents portátil)
     center_model_view(doc, bbox_ins, pad=1.02)
