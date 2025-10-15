@@ -2,10 +2,9 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
-import shutil, os, zipfile, traceback
+import shutil, os, zipfile, traceback, json
 
 # IMPORTA TU SCRIPT DE CONVERSIÓN
-# Debe existir app/kmz2cad.py con una función main() como la que pegaste
 from app import kmz2cad
 
 # ─────────────────────────────
@@ -89,13 +88,22 @@ async def process(
     file: UploadFile | None = File(None),
     test_kmz: UploadFile | None = File(None),
     output: str = Form("both"),  # "pdf" | "dwg" | "both"
+
+    # ⬇️⬇️ NUEVO: metadatos administrativos enviados por el front
+    ubigeo: str | None = Form(None),
+    departamento: str | None = Form(None),
+    provincia: str | None = Form(None),
+    distrito: str | None = Form(None),
 ):
     """
     Convierte KMZ/KML → (PDF/DXF/DWG). Usa tu kmz2cad.main() que genera:
       - PLANTILLA_FINAL.dxf
       - I-01.pdf
       - exportado_wgs84.dwg (si ODA disponible)
+
+    Además, recibe metadatos (UBIGEO/DEPTO/PROV/DIST) para que el script los plasme en el plano.
     """
+
     # 1) Workspace en /tmp
     work = _ensure_workspace()
 
@@ -113,12 +121,33 @@ async def process(
     # 3) Copiar plantilla al workspace
     _copy_template_to(work)
 
-    # 4) Ejecutar tu main() dentro de /tmp/conv
+    # 4) Guardar metadatos en meta.json y preparar ENV (opcional)
+    meta = {
+        "ubigeo": (ubigeo or "").strip(),
+        "departamento": (departamento or "").strip(),
+        "provincia": (provincia or "").strip(),
+        "distrito": (distrito or "").strip()
+    }
+    meta_path = work / "meta.json"
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Prepara variables de entorno (por si tu script prefiere leer ENV)
+    env = os.environ.copy()
+    env["UBIGEO"] = meta["ubigeo"]
+    env["DEPARTAMENTO"] = meta["departamento"]
+    env["PROVINCIA"] = meta["provincia"]
+    env["DISTRITO"] = meta["distrito"]
+
+    # 5) Ejecutar tu main() dentro de /tmp/conv
+    #    Si tu kmz2cad.main() no acepta args, puede leer meta.json y/o ENV.
     cwd = os.getcwd()
     os.chdir(work)
     try:
-        print("[INFO] Leyendo KMZ con colores…")
-        kmz2cad.main()  # tu función main() ya busca nombres relativos
+        print("[INFO] Iniciando kmz2cad.main() con meta.json y ENV...")
+        # Opción A: si quieres llamar como script externo con args:
+        #   subprocess.run(["python3", "-m", "app.kmz2cad", "--meta", "meta.json"], check=True, env=env)
+        # Opción B: si tu main() lee meta.json/ENV por sí mismo:
+        kmz2cad.main()
     except Exception:
         tb = traceback.format_exc()
         print("[ERROR] Falló kmz2cad.main():\n", tb)
@@ -127,7 +156,7 @@ async def process(
     finally:
         os.chdir(cwd)
 
-    # 5) Recolectar salidas
+    # 6) Recolectar salidas
     pdf = work / "I-01.pdf"
     dxf = work / "PLANTILLA_FINAL.dxf"
     dwg = work / "exportado_wgs84.dwg"  # si ODA/Teigha disponible
@@ -150,7 +179,7 @@ async def process(
     if not outs:
         raise HTTPException(500, "No se generaron salidas.")
 
-    # 6) Empaquetar/retornar
+    # 7) Empaquetar/retornar
     if len(outs) == 1:
         p = outs[0]
         out_name = p.name
