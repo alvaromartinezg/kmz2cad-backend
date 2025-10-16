@@ -538,7 +538,7 @@ def export_layout_pdf_viewport(doc, layout_name, pdf_path):
                 (x1, y1), (x2, y2) = seg
                 X1, Y1 = to_paper(x1, y1)
                 X2, Y2 = to_paper(x2, y2)
-                ax.add_line(plt.Line2D([X1, X2], [Y1, Y2], linewidth=1.2, color=_rgb_from_entity(e)))
+                ax.add_line(plt.Line2D([X1, X2], [Y1, Y2], linewidth=1, color=_rgb_from_entity(e))) #Antes era 1.2 width
                 any_drawn = True
 
             elif e.dxftype() == "LWPOLYLINE":
@@ -1200,23 +1200,38 @@ def set_zone_utm_in_layout(doc, layout_name, zone_text):
 STD_SCALES = (500, 1000, 2000, 5000, 10000, 25000, 50000)
 
 def _ensure_frame_viewport(doc, layout_name, frame_rect):
-    """Crea (o reemplaza) un VIEWPORT que ocupe exactamente frame_rect en papel."""
+    """
+    Garantiza que exista EXACTAMENTE 1 VIEWPORT que ocupe 'frame_rect' en papel.
+    - Si ya hay viewports: reutiliza el mayor y AJÚSTALO al marco.
+    - Si no hay: crea uno.
+    NO crea un segundo viewport.
+    """
     layout = doc.layouts.get(layout_name)
-    # borra el mayor viewport si existe
-    for e in list(layout):
-        try:
-            if e.dxftype() == "VIEWPORT":
-                e.destroy()
-        except Exception:
-            pass
+
+    # 1) Reutiliza el mayor si existe, o crea uno
+    vps = [e for e in layout if e.dxftype() == "VIEWPORT"]
+    if vps:
+        vp = max(vps, key=lambda v: float(v.dxf.width or 0) * float(v.dxf.height or 0))
+    else:
+        # crea uno provisional; centraremos y escalaremos luego
+        vp = layout.add_viewport(center=(210.0, 148.5), size=(200.0, 140.0))
+        try: vp.dxf.status = 1
+        except Exception: pass
+
+    # 2) Ajusta ese MISMO viewport al rectángulo del marco
     x0, y0, x1, y1 = map(float, frame_rect)
-    center = ((x0+x1)/2.0, (y0+y1)/2.0)
-    size   = (x1-x0, y1-y0)
-    # crea un viewport “en blanco”; view_center/height se setean luego
-    vp = layout.add_viewport(center=center, size=size, view_center_point=(0.0, 0.0), view_height=1.0)
+    center = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+    size   = (x1 - x0, y1 - y0)
+    vp.dxf.center = center
+    vp.dxf.width  = size[0]
+    vp.dxf.height = size[1]
+
+    # (No tocamos view_center_point ni view_height aquí; eso lo hace apply_best_standard_scale)
     try: vp.dxf.status = 1
     except Exception: pass
     return vp
+
+
 
 def apply_best_standard_scale(doc, layout_name, offset_lonlat, frame_rect,
                               standards=STD_SCALES, epsg_override=None):
@@ -1372,11 +1387,9 @@ def main():
     cnt = apply_scale_text(doc, LAYOUT_NAME, best_n)
     print(f"[INFO] Textos 'ESC' actualizados: {cnt}")
 
-    # 9) Guardar DXF final
-    doc.saveas(FINAL_DXF_OUT)
-    print(f"[OK] Plantilla final: {FINAL_DXF_OUT}")
-
+ 
     # 10) Reabrir solo para exportar PDF tal cual se ve el layout
+    doc.saveas(FINAL_DXF_OUT)
     doc = ezdxf.readfile(FINAL_DXF_OUT)
     fit_layout_viewport(
         doc, LAYOUT_NAME, bbox_ins,
@@ -1389,6 +1402,11 @@ def main():
     export_layout_pdf_viewport(doc, LAYOUT_NAME, PDF_OUT)
     print(f"[OK] PDF: {PDF_OUT}")
     print("[OK] Proceso completo.")
+
+    # 9) Guardar DXF final
+    doc.saveas(FINAL_DXF_OUT)
+    print(f"[OK] Plantilla final: {FINAL_DXF_OUT}")
+
 
 
 if __name__ == "__main__":
