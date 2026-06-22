@@ -13,9 +13,8 @@ from app import kmz2cad
 ALLOWED_ORIGINS = [
     "https://alvaromartinezg.github.io",
     "https://alvaromartinezg.github.io/transmission.department",
-    "http://localhost:5500",
-    "http://localhost:5173",
-    "http://127.0.0.1:5500",
+    "https://transmission.38-250-161-19.nip.io/"
+    "https://38-250-161-19.nip.io/"
 ]
 
 # Nombre que tu script espera
